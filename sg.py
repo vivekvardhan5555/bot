@@ -1,5 +1,9 @@
 """
-OTPDoctor Telegram Bot — Railway Deployable Version
+OTPDoctor Telegram Bot
+─────────────────────
+Flow: /start → (API key once per user) → search service → pick → how many
+      → buy in parallel → [Swiggy only] check trickhack.in → cancel/keep
+      → poll → OTP decision
 """
 
 import os
@@ -10,7 +14,12 @@ import time
 import requests as req
 from dataclasses import dataclass, field
 from typing import Optional
-import logging
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,28 +31,21 @@ from telegram.error import BadRequest, TimedOut
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required!")
-
+TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
 BASE_URL      = "https://otpdoctor.in/stubs/handler_api.php"
 CHECK_URL     = "https://trickhack.in/Swiggy/"
 PAGE_SIZE     = 10
 POLL_INTERVAL = 10
 HARD_TIMEOUT  = 600
 CHECK_EVERY   = 120
-MAX_RETRIES   = 177
-SWIGGY_RETRIES = 5
-SWIGGY_DELAY  = 3
 
 # ── Conversation states ───────────────────────────────────────────────────────
 
 WAIT_API_KEY, WAIT_SEARCH, WAIT_COUNT = range(3)
 
-# ── Persistent stores ─────────────────────────────────────────────────────────
+# ── Persistent API key store (per Telegram user_id) ──────────────────────────
 
-USER_KEYS: dict[int, str] = {}
-USED_NUMBERS: set[str] = set()
+USER_KEYS: dict[int, str] = {}   # user_id → api_key (survives across /start)
 
 # ── OTPDoctor helpers ─────────────────────────────────────────────────────────
 
@@ -92,7 +94,7 @@ def get_status(api_key: str, order_id: str) -> str:
 def set_status(api_key: str, order_id: str, code: int) -> str:
     return api_raw({"action": "setStatus", "id": order_id, "status": code}, api_key)
 
-# ── Swiggy web check with RETRY ──────────────────────────────────────────────
+# ── Swiggy web check ──────────────────────────────────────────────────────────
 
 def check_swiggy(phone: str) -> tuple[str, str]:
     try:
@@ -110,25 +112,6 @@ def check_swiggy(phone: str) -> tuple[str, str]:
     except Exception as e:
         return "⚠️", f"Check failed: {e}"
 
-def check_swiggy_with_retry(phone: str) -> tuple[str, str]:
-    for attempt in range(1, SWIGGY_RETRIES + 1):
-        icon, text = check_swiggy(phone)
-        if icon in ["✅", "❌", "ℹ️"]:
-            return icon, text
-        if attempt < SWIGGY_RETRIES:
-            time.sleep(SWIGGY_DELAY)
-    return "❓", f"Unknown response after {SWIGGY_RETRIES} retries"
-
-def is_registered_on_swiggy(phone: str) -> bool:
-    icon, text = check_swiggy_with_retry(phone)
-    if "already" in text.lower() or "registered" in text.lower():
-        return True
-    if "exists" in text.lower():
-        return True
-    if icon == "✅" and ("account" in text.lower() or "user" in text.lower()):
-        return True
-    return False
-
 # ── Session / Order model ─────────────────────────────────────────────────────
 
 @dataclass
@@ -137,11 +120,8 @@ class Order:
     order_id:   str
     phone:      str
     otps:       list = field(default_factory=list)
+    # pending | polling | otp_check | received | cancelled | timeout | ext_cancel
     status:     str  = "pending"
-    attempts:   int  = 0
-    is_registered: bool = False
-    swiggy_icon: str = ""
-    swiggy_text: str = ""
 
 @dataclass
 class Session:
@@ -155,7 +135,6 @@ class Session:
     count:        int    = 0
     orders:       list   = field(default_factory=list)
     poll_task:    object = None
-    cancelled_numbers: set = field(default_factory=set)
 
 SESSIONS: dict[int, Session] = {}
 
@@ -184,12 +163,6 @@ async def safe_edit_markup(query, markup):
     except (BadRequest, TimedOut):
         pass
 
-async def safe_send(chat_id, app, text, **kwargs):
-    try:
-        await app.bot.send_message(chat_id, text, **kwargs)
-    except (BadRequest, TimedOut):
-        pass
-
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def service_keyboard(hits: list, page: int) -> InlineKeyboardMarkup:
@@ -209,18 +182,11 @@ def service_keyboard(hits: list, page: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔍 New search", callback_data="newsearch")])
     return InlineKeyboardMarkup(rows)
 
-def pre_poll_keyboard(order_id: str, is_registered: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if is_registered:
-        rows.append([InlineKeyboardButton(
-            "⚠️ Already Registered — Auto-cancel in 2 min",
-            callback_data="dummy"
-        )])
-    rows.append([
-        InlineKeyboardButton("❌ Cancel", callback_data=f"precancel:{order_id}"),
+def pre_poll_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel",      callback_data=f"precancel:{order_id}"),
         InlineKeyboardButton("✅ Keep & poll", callback_data=f"keepoll:{order_id}"),
-    ])
-    return InlineKeyboardMarkup(rows)
+    ]])
 
 def start_poll_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -234,6 +200,7 @@ def otp_keyboard(order_id: str) -> InlineKeyboardMarkup:
     ]])
 
 def wait_keyboard(orders: list) -> InlineKeyboardMarkup:
+    """orders is a list of Order objects so we can show phone numbers."""
     rows = []
     for o in orders:
         rows.append([InlineKeyboardButton(
@@ -249,6 +216,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # Reuse existing session if user has a valid API key
     if user_id in USER_KEYS:
         api_key = USER_KEYS[user_id]
         SESSIONS[chat_id] = Session(api_key=api_key)
@@ -274,7 +242,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return WAIT_API_KEY
 
-# ── Step 1 — API key ──────────────────────────────────────────────────────────
+# ── Step 1 — API key (only needed once per user) ──────────────────────────────
 
 async def recv_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -287,7 +255,7 @@ async def recv_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await msg.edit_text("❌ Invalid API key. Send a valid key:")
         return WAIT_API_KEY
 
-    USER_KEYS[user_id] = key
+    USER_KEYS[user_id] = key          # remember forever for this user
     s = sess(chat_id)
     s.api_key = key
 
@@ -366,85 +334,27 @@ async def cb_pick_service(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     )
     return WAIT_COUNT
 
-# ── Step 3 — count → parallel purchase ──────────────────────────────────────
+# ── Step 3 — count → parallel purchase → site check ──────────────────────────
 
-async def _buy_one(
-    idx: int,
-    api_key: str,
-    service_id: str,
-    status_map: dict,
-    chat_id: int,
-    app,
-) -> Order:
+async def _buy_one(idx: int, api_key: str, service_id: str, status_map: dict) -> Order:
+    """Retry until a number is obtained. Updates status_map[idx] on every attempt."""
     attempt = 0
-    while attempt < MAX_RETRIES:
+    while True:
         attempt += 1
-        status_map[idx] = f"⟳ [{idx}] attempt {attempt}/{MAX_RETRIES}…"
-        
-        if attempt % 30 == 0 and attempt > 1:
-            await safe_send(
-                chat_id,
-                app,
-                f"⏳ *{attempt} attempts* for number #{idx}.\n"
-                f"Still waiting for OTPDoctor to assign a number.\n\n"
-                f"Do you want to *continue* or *stop*?",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("▶ Continue", callback_data=f"retry_continue:{idx}"),
-                    InlineKeyboardButton("⏹ Stop", callback_data=f"retry_stop:{idx}"),
-                ]])
-            )
-            s = sess(chat_id)
-            if f"stop_{idx}" in s.__dict__:
-                o = Order(idx=idx, order_id="", phone="")
-                o.status = "cancelled"
-                o.attempts = attempt
-                return o
-
+        status_map[idx] = f"⟳ [{idx}] attempt {attempt}…"
         order_id, phone, err = get_number(api_key, service_id)
-        
         if order_id:
-            if phone in USED_NUMBERS:
-                await safe_send(
-                    chat_id,
-                    app,
-                    f"ℹ️ Number `{phone}` is already checked.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            else:
-                USED_NUMBERS.add(phone)
-            
             status_map[idx] = f"✅ [{idx}] `{phone}`"
-            o = Order(idx=idx, order_id=order_id, phone=phone)
-            o.attempts = attempt
-            return o
-            
+            return Order(idx=idx, order_id=order_id, phone=phone)
         elif err == "NO_NUMBERS":
-            status_map[idx] = f"⟳ [{idx}] no numbers — attempt {attempt}/{MAX_RETRIES}, retrying…"
+            status_map[idx] = f"⟳ [{idx}] no numbers — attempt {attempt}, retrying…"
             await asyncio.sleep(3)
         else:
             status_map[idx] = f"❌ [{idx}] failed: {err}"
             o = Order(idx=idx, order_id="", phone="")
             o.status = "failed"
-            o.attempts = attempt
-            o._err = err
+            o._err = err   # type: ignore[attr-defined]
             return o
-
-    status_map[idx] = f"⏰ [{idx}] max retries ({MAX_RETRIES}) reached — stopped"
-    o = Order(idx=idx, order_id="", phone="")
-    o.status = "timeout"
-    o.attempts = MAX_RETRIES
-    o._err = f"Max retries ({MAX_RETRIES}) exceeded"
-    
-    await safe_send(
-        chat_id,
-        app,
-        f"🛑 *Operation stopped* for number #{idx}.\n"
-        f"Max retries ({MAX_RETRIES}) reached.\n\n"
-        f"Send /start to try again.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return o
 
 async def _live_status_updater(
     status_msg,
@@ -453,6 +363,7 @@ async def _live_status_updater(
     count: int,
     done_evt: asyncio.Event,
 ):
+    """Polls status_map every second and edits the message when content changes."""
     last_text = ""
     while not done_evt.is_set():
         lines    = [status_map.get(i, f"⏳ [{i}] waiting…") for i in range(1, count + 1)]
@@ -464,34 +375,6 @@ async def _live_status_updater(
             except Exception:
                 pass
         await asyncio.sleep(1)
-
-# ── Retry decision callbacks ──────────────────────────────────────────────────
-
-async def cb_retry_continue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    idx = int(query.data.split(":")[1])
-    chat_id = query.message.chat_id
-    await safe_answer(query, "▶ Continuing…")
-    await safe_edit_markup(query, None)
-    await safe_send(chat_id, ctx.application, f"▶ Continuing attempts for number #{idx}…")
-
-async def cb_retry_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    idx = int(query.data.split(":")[1])
-    chat_id = query.message.chat_id
-    s = sess(chat_id)
-    s.__dict__[f"stop_{idx}"] = True
-    await safe_answer(query, "⏹ Stopped")
-    await safe_edit_markup(query, None)
-    await safe_send(
-        chat_id,
-        ctx.application,
-        f"🛑 *Operation stopped* for number #{idx}.\n\n"
-        f"Send /start to try again.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-# ── recv_count ───────────────────────────────────────────────────────────────
 
 async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
@@ -509,32 +392,32 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     header     = f"🛒 Purchasing *{count}* number(s) for *{s.service_name}*…"
     status_msg = await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
+    # Shared state for live updates
     status_map: dict[int, str] = {i: f"⏳ [{i}] waiting…" for i in range(1, count + 1)}
     done_evt = asyncio.Event()
 
+    # Start the live-updater task (polls every 1 s, edits message on change)
     updater_task = asyncio.create_task(
         _live_status_updater(status_msg, header, status_map, count, done_evt)
     )
 
+    # ── Buy all numbers in parallel ───────────────────────────────────────────
     results: list[Order] = await asyncio.gather(
-        *[_buy_one(i, s.api_key, s.service_id, status_map, chat_id, ctx.application)
+        *[_buy_one(i, s.api_key, s.service_id, status_map)
           for i in range(1, count + 1)]
     )
 
+    # Stop updater and do one final edit
     done_evt.set()
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(1.2)   # let updater fire one last time
     updater_task.cancel()
 
     err_map = {"NO_BALANCE": "Insufficient balance", "BAD_SERVICE": "Invalid service ID", "TRY_AGAIN": "Temporary error"}
-    lines = []
+    lines   = []
     for o in results:
         if o.status == "failed":
             err = getattr(o, "_err", "Unknown error")
             lines.append(f"❌ [{o.idx}] Failed: {err_map.get(err, err)}")
-        elif o.status == "cancelled":
-            lines.append(f"⏹ [{o.idx}] Stopped by user at attempt {o.attempts}")
-        elif o.status == "timeout":
-            lines.append(f"⏰ [{o.idx}] Max retries ({MAX_RETRIES}) reached")
         else:
             s.orders.append(o)
             lines.append(f"✅ [{o.idx}] `{o.phone}`")
@@ -554,38 +437,29 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("❌ Could not buy any numbers. Use /start to try again.")
         return ConversationHandler.END
 
+    # ── Swiggy-only web check ─────────────────────────────────────────────────
     is_swiggy = "swiggy" in s.service_name.lower()
 
     if is_swiggy:
-        await update.message.reply_text("🔍 Checking each number on Swiggy...")
+        await update.message.reply_text("🔍 Checking each number on Swiggy…")
         for o in s.orders:
-            icon, result_text = check_swiggy_with_retry(o.phone)
-            
-            o.swiggy_icon = icon
-            o.swiggy_text = result_text
-            o.is_registered = is_registered_on_swiggy(o.phone)
-            
-            registered_warning = " ⚠️ *Already registered!*" if o.is_registered else ""
-            
+            icon, result_text = check_swiggy(o.phone)
             await update.message.reply_text(
                 f"📞 `{o.phone}`\n"
-                f"🌐 Swiggy check: {icon} {result_text}{registered_warning}\n\n"
+                f"🌐 Swiggy check: {icon} {result_text}\n\n"
                 f"What do you want to do with this number?",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=pre_poll_keyboard(o.order_id, o.is_registered),
+                reply_markup=pre_poll_keyboard(o.order_id),
             )
             await asyncio.sleep(0.3)
 
         await update.message.reply_text(
             "👆 Review numbers above — cancel any you don't need.\n\n"
-            "⚠️ *Already registered* numbers will be *auto-cancelled after 2 minutes*.\n"
-            "Non-registered numbers will NOT be auto-cancelled.\n\n"
             "When ready, tap below to start polling for OTPs:",
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=start_poll_keyboard(),
         )
-        asyncio.create_task(auto_cancel_timer(chat_id, ctx.application))
     else:
+        # No web check — mark all as polling and go straight to polling
         for o in s.orders:
             o.status = "polling"
         phones = "\n".join(f"📞 `{o.phone}`" for o in s.orders)
@@ -599,44 +473,7 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     return ConversationHandler.END
 
-# ── Auto-cancel timer for REGISTERED numbers only ────────────────────────────
-
-async def auto_cancel_timer(chat_id: int, app):
-    await asyncio.sleep(120)
-    s = sess(chat_id)
-    
-    pending = [o for o in s.orders if o.status == "pending" and o.is_registered]
-    
-    if pending:
-        for o in pending:
-            set_status(s.api_key, o.order_id, 8)
-            o.status = "cancelled"
-            await safe_send(
-                chat_id,
-                app,
-                f"⏰ *Auto-cancelled* `{o.phone}` — already registered on Swiggy, 2 minutes passed without action.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        await safe_send(
-            chat_id,
-            app,
-            f"⏰ *{len(pending)} registered number(s)* auto-cancelled after 2 minutes.\n"
-            f"Send /start to try again.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        non_reg_pending = [o for o in s.orders if o.status == "pending" and not o.is_registered]
-        if non_reg_pending:
-            phones = ", ".join(f"`{o.phone}`" for o in non_reg_pending)
-            await safe_send(
-                chat_id,
-                app,
-                f"ℹ️ *{len(non_reg_pending)} non-registered number(s)* still pending:\n{phones}\n\n"
-                f"They will NOT be auto-cancelled. Use the buttons above to keep or cancel them.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-# ── Pre-poll buttons ──────────────────────────────────────────────────────────
+# ── Pre-poll buttons (Swiggy check results) ───────────────────────────────────
 
 async def cb_precancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
@@ -648,7 +485,6 @@ async def cb_precancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if order and order.status == "pending":
         set_status(s.api_key, order_id, 8)
         order.status = "cancelled"
-        s.cancelled_numbers.add(order.phone)
         await safe_answer(query, "❌ Cancelled")
         await safe_edit_markup(query, None)
         await query.message.reply_text(
@@ -681,6 +517,7 @@ async def cb_startpoll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     s       = sess(chat_id)
 
+    # Auto-poll any still-pending numbers (user didn't tap either button)
     for o in s.orders:
         if o.status == "pending":
             o.status = "polling"
@@ -724,6 +561,7 @@ async def poll_all(chat_id: int, app: Application):
             if raw.startswith("STATUS_OK:"):
                 otp = raw.split(":", 1)[1]
                 if otp in o.otps:
+                    # Same OTP as before — keep polling silently for a new one
                     continue
                 o.otps.append(otp)
                 o.status = "otp_check"
@@ -761,6 +599,7 @@ async def poll_all(chat_id: int, app: Application):
                 except Exception:
                     pass
 
+        # 2-min nudge
         if time.time() >= next_check:
             still = [o for o in s.orders if o.status == "polling"]
             if still:
@@ -787,9 +626,7 @@ async def send_final_summary(chat_id: int, app: Application):
     for o in s.orders:
         icon     = {"received": "✅", "cancelled": "❌", "timeout": "⏰", "ext_cancel": "🚫"}.get(o.status, "❓")
         otp_text = " | ".join(o.otps) if o.otps else o.status
-        registered_tag = " [REG]" if o.is_registered else ""
-        swiggy_tag = f" {o.swiggy_icon}" if o.swiggy_icon else ""
-        lines.append(f"{icon} [{o.idx}] `{o.phone}`{registered_tag}{swiggy_tag} — {otp_text}")
+        lines.append(f"{icon} [{o.idx}] `{o.phone}` — {otp_text}")
 
     bal      = get_balance(s.api_key)
     bal_text = f"\n\n💰 Remaining balance: ₹{bal}" if bal else ""
@@ -861,7 +698,6 @@ async def cb_cancel_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if o.status == "polling":
             set_status(s.api_key, o.order_id, 8)
             o.status = "cancelled"
-            s.cancelled_numbers.add(o.phone)
             cancelled.append(o.phone)
 
     await safe_answer(query, "❌ Cancelled all")
@@ -885,12 +721,13 @@ async def cb_cancel_one(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if order and order.status == "polling":
         set_status(s.api_key, order_id, 8)
         order.status = "cancelled"
-        s.cancelled_numbers.add(order.phone)
         await safe_answer(query, f"❌ Cancelled {order.phone}")
 
+        # Remove this button from the wait message
         still = [o for o in s.orders if o.status == "polling"]
         await safe_edit_markup(query, wait_keyboard(still) if still else None)
 
+        # New message confirming action
         try:
             await query.message.reply_text(
                 f"❌ `{order.phone}` has been *cancelled.*",
@@ -899,6 +736,7 @@ async def cb_cancel_one(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # Confirm still-polling numbers continue
         if still:
             phones = ", ".join(f"`{o.phone}`" for o in still)
             try:
@@ -931,6 +769,7 @@ async def cb_keep_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Global error handler ──────────────────────────────────────────────────────
 
+import logging
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.WARNING,
@@ -938,12 +777,13 @@ logging.basicConfig(
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, (TimedOut, BadRequest)):
-        return
+        return  # transient Telegram network hiccups — ignore silently
     logging.warning("Unhandled exception: %s", ctx.error)
 
-# ── "cancel" text handler ─────────────────────────────────────────────────────
+# ── "cancel" text handler (works any time, including during polling) ──────────
 
 async def msg_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User typed 'cancel' — show live cancel menu if polling is active."""
     chat_id = update.effective_chat.id
     s       = sess(chat_id)
 
@@ -961,7 +801,7 @@ async def msg_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=wait_keyboard(still),
     )
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
+# ── /cancel (inside conversation flow) ───────────────────────────────────────
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Cancelled. Send /start to begin again.")
@@ -1001,9 +841,7 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_error_handler(error_handler)
 
-    app.add_handler(CallbackQueryHandler(cb_retry_continue, pattern=r"^retry_continue:"))
-    app.add_handler(CallbackQueryHandler(cb_retry_stop, pattern=r"^retry_stop:"))
-
+    # "cancel" typed as plain text during polling
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^cancel$"),
         msg_cancel,
@@ -1019,8 +857,6 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_keep_wait,  pattern=r"^keep_wait$"))
 
     print("🤖 Bot started — polling for updates…")
-
-    # ── Railway: Use polling (webhook not required) ──
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
