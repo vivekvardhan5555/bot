@@ -10,6 +10,7 @@ import os
 import re
 import asyncio
 import json
+import logging
 import time
 import requests as req
 from dataclasses import dataclass, field
@@ -29,6 +30,11 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TimedOut
 
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.WARNING,
+)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -38,16 +44,23 @@ PAGE_SIZE     = 10
 POLL_INTERVAL = 10
 HARD_TIMEOUT  = 600
 CHECK_EVERY   = 120
+RETRY_PROMPT  = 30        # ask user every N NO_NUMBERS attempts
 
 # ── Conversation states ───────────────────────────────────────────────────────
 
 WAIT_API_KEY, WAIT_SEARCH, WAIT_COUNT = range(3)
 
-# ── Persistent API key store (per Telegram user_id) ──────────────────────────
+# ── Persistent stores (survive across /start) ─────────────────────────────────
 
-USER_KEYS: dict[int, str] = {}   # user_id → api_key (survives across /start)
+USER_KEYS:      dict[int, str]       = {}   # user_id → api_key
+CHECKED_PHONES: dict[int, set]       = {}   # user_id → set of already-seen phones
 
-# ── OTPDoctor helpers ─────────────────────────────────────────────────────────
+# ── Per-slot buy-pause events (chat_id, slot_idx) ────────────────────────────
+
+SLOT_STOP: dict[tuple, asyncio.Event] = {}   # (chat_id, idx) → stop event
+SLOT_CONT: dict[tuple, asyncio.Event] = {}   # (chat_id, idx) → continue event
+
+# ── OTPDoctor API helpers ─────────────────────────────────────────────────────
 
 def api_raw(params: dict, api_key: str, timeout: int = 60) -> str:
     p = dict(params)
@@ -64,15 +77,26 @@ def get_balance(api_key: str) -> Optional[str]:
 
 def fetch_services(api_key: str):
     try:
-        r = req.get(BASE_URL, params={"action": "getServices", "api_key": api_key, "country": "in"}, timeout=30)
+        r = req.get(
+            BASE_URL,
+            params={"action": "getServices", "api_key": api_key, "country": "in"},
+            timeout=30,
+        )
         text = r.text.strip()
         if text.startswith("{"):
             data = json.loads(text)
-            return sorted([
-                {"id": sid, "name": info.get("service_name", "").strip(),
-                 "price": info.get("service_price", "?"), "server": info.get("server_name", "")}
-                for sid, info in data.items()
-            ], key=lambda x: x["name"].lower()), None
+            return sorted(
+                [
+                    {
+                        "id": sid,
+                        "name": info.get("service_name", "").strip(),
+                        "price": info.get("service_price", "?"),
+                        "server": info.get("server_name", ""),
+                    }
+                    for sid, info in data.items()
+                ],
+                key=lambda x: x["name"].lower(),
+            ), None
         return None, text
     except Exception as e:
         return None, str(e)
@@ -101,7 +125,7 @@ def check_swiggy(phone: str) -> tuple[str, str]:
         r = req.post(CHECK_URL, data={"mobile": phone}, timeout=30)
         m = re.search(
             r'<div[^>]*class="result\s+(success|error|info)"[^>]*>(.*?)</div>',
-            r.text, re.DOTALL
+            r.text, re.DOTALL,
         )
         if m:
             cls  = m.group(1)
@@ -116,12 +140,12 @@ def check_swiggy(phone: str) -> tuple[str, str]:
 
 @dataclass
 class Order:
-    idx:        int
-    order_id:   str
-    phone:      str
-    otps:       list = field(default_factory=list)
-    # pending | polling | otp_check | received | cancelled | timeout | ext_cancel
-    status:     str  = "pending"
+    idx:      int
+    order_id: str
+    phone:    str
+    otps:     list = field(default_factory=list)
+    # pending | polling | otp_check | received | cancelled | timeout | ext_cancel | stopped
+    status:   str  = "pending"
 
 @dataclass
 class Session:
@@ -167,7 +191,7 @@ async def safe_edit_markup(query, markup):
 
 def service_keyboard(hits: list, page: int) -> InlineKeyboardMarkup:
     start = page * PAGE_SIZE
-    chunk = hits[start: start + PAGE_SIZE]
+    chunk = hits[start : start + PAGE_SIZE]
     rows  = []
     for i, s in enumerate(chunk):
         label = f"{s['name'][:22]}  ₹{s['price']}"
@@ -200,7 +224,6 @@ def otp_keyboard(order_id: str) -> InlineKeyboardMarkup:
     ]])
 
 def wait_keyboard(orders: list) -> InlineKeyboardMarkup:
-    """orders is a list of Order objects so we can show phone numbers."""
     rows = []
     for o in orders:
         rows.append([InlineKeyboardButton(
@@ -210,21 +233,34 @@ def wait_keyboard(orders: list) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⏳ Keep waiting (2 min)", callback_data="keep_wait")])
     return InlineKeyboardMarkup(rows)
 
+def buy_again_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛒 Buy More Numbers", callback_data="buy_again"),
+    ]])
+
+def retry_keyboard(chat_id: int, idx: int) -> InlineKeyboardMarkup:
+    """Shown after every 30 NO_NUMBERS retries for a slot."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶ Continue",    callback_data=f"buycon:{chat_id}:{idx}"),
+        InlineKeyboardButton("⏹ Stop this",  callback_data=f"buystop:{chat_id}:{idx}"),
+    ]])
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # Reuse existing session if user has a valid API key
     if user_id in USER_KEYS:
         api_key = USER_KEYS[user_id]
         SESSIONS[chat_id] = Session(api_key=api_key)
-        s = sess(chat_id)
+        s   = sess(chat_id)
         msg = await update.message.reply_text("⏳ Loading India services…")
         services, err = fetch_services(api_key)
         if err or not services:
-            await msg.edit_text(f"❌ Could not load services: {err or 'empty'}. Try /start again.")
+            await msg.edit_text(
+                f"❌ Could not load services: {err or 'empty'}. Try /start again."
+            )
             return ConversationHandler.END
         s.services = services
         bal = get_balance(api_key)
@@ -242,6 +278,40 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return WAIT_API_KEY
 
+# ── "Buy Again" callback — re-enters the search flow without asking for key ───
+
+async def cb_buy_again(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query   = update.callback_query
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    await safe_answer(query)
+
+    if user_id not in USER_KEYS:
+        await query.message.reply_text(
+            "No API key on record. Send /start to set up."
+        )
+        return ConversationHandler.END
+
+    api_key = USER_KEYS[user_id]
+    SESSIONS[chat_id] = Session(api_key=api_key)
+    s   = sess(chat_id)
+    msg = await query.message.reply_text("⏳ Loading India services…")
+    services, err = fetch_services(api_key)
+    if err or not services:
+        await msg.edit_text(
+            f"❌ Could not load services: {err or 'empty'}. Try /start again."
+        )
+        return ConversationHandler.END
+    s.services = services
+    bal = get_balance(api_key)
+    await msg.edit_text(
+        f"✅ Balance: ₹{bal}  |  {len(services)} services available\n\n"
+        "🔍 *Search a service* — type a name (e.g. `swiggy`, `telegram`, `zomato`):",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAIT_SEARCH
+
 # ── Step 1 — API key (only needed once per user) ──────────────────────────────
 
 async def recv_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -255,14 +325,16 @@ async def recv_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await msg.edit_text("❌ Invalid API key. Send a valid key:")
         return WAIT_API_KEY
 
-    USER_KEYS[user_id] = key          # remember forever for this user
+    USER_KEYS[user_id] = key
     s = sess(chat_id)
     s.api_key = key
 
     await msg.edit_text(f"✅ Balance: ₹{bal}\n\n⏳ Loading India services…")
     services, err = fetch_services(key)
     if err or not services:
-        await msg.edit_text(f"❌ Could not load services: {err or 'empty'}. Try /start again.")
+        await msg.edit_text(
+            f"❌ Could not load services: {err or 'empty'}. Try /start again."
+        )
         return ConversationHandler.END
 
     s.services = services
@@ -284,14 +356,17 @@ async def recv_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not hits:
         await update.message.reply_text(
             f"❌ No service matching *{query}*. Try another name:",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return WAIT_SEARCH
 
     s.search_hits = hits
     s.search_page = 0
-    text = (f"Found *{len(hits)}* service(s) for `{query}` — pick one:"
-            if query else f"All *{len(hits)}* services — pick one:")
+    text = (
+        f"Found *{len(hits)}* service(s) for `{query}` — pick one:"
+        if query
+        else f"All *{len(hits)}* services — pick one:"
+    )
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
         reply_markup=service_keyboard(hits, 0),
@@ -336,25 +411,114 @@ async def cb_pick_service(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 
 # ── Step 3 — count → parallel purchase → site check ──────────────────────────
 
-async def _buy_one(idx: int, api_key: str, service_id: str, status_map: dict) -> Order:
-    """Retry until a number is obtained. Updates status_map[idx] on every attempt."""
-    attempt = 0
+async def _buy_one(
+    idx: int,
+    api_key: str,
+    service_id: str,
+    status_map: dict,
+    chat_id: int,
+    app: Application,
+) -> Order:
+    """Retry until a number is obtained.
+    Every RETRY_PROMPT consecutive NO_NUMBERS, ask the user to continue or stop.
+    """
+    attempt      = 0
+    no_num_count = 0
+
     while True:
-        attempt += 1
+        attempt      += 1
+        no_num_count += 1
         status_map[idx] = f"⟳ [{idx}] attempt {attempt}…"
         order_id, phone, err = get_number(api_key, service_id)
+
         if order_id:
             status_map[idx] = f"✅ [{idx}] `{phone}`"
             return Order(idx=idx, order_id=order_id, phone=phone)
+
         elif err == "NO_NUMBERS":
             status_map[idx] = f"⟳ [{idx}] no numbers — attempt {attempt}, retrying…"
+
+            # ── Every RETRY_PROMPT attempts: ask the user ─────────────────────
+            if no_num_count % RETRY_PROMPT == 0:
+                key = (chat_id, idx)
+                stop_evt = asyncio.Event()
+                cont_evt = asyncio.Event()
+                SLOT_STOP[key] = stop_evt
+                SLOT_CONT[key] = cont_evt
+
+                try:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"⚠️ *Slot [{idx}]* has tried *{attempt} times* with no numbers "
+                        f"available yet.\n\nContinue retrying or stop this slot?",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=retry_keyboard(chat_id, idx),
+                    )
+                except Exception:
+                    pass
+
+                # Wait (polling every second) until user taps a button
+                while not stop_evt.is_set() and not cont_evt.is_set():
+                    await asyncio.sleep(1)
+
+                # Clean up
+                SLOT_STOP.pop(key, None)
+                SLOT_CONT.pop(key, None)
+
+                if stop_evt.is_set():
+                    status_map[idx] = f"⏹ [{idx}] stopped by user after {attempt} attempts"
+                    o = Order(idx=idx, order_id="", phone="")
+                    o.status = "stopped"
+                    return o
+                # else: continue — reset streak counter so next prompt is 30 more
+                no_num_count = 0
+
             await asyncio.sleep(3)
+
         else:
+            # Hard error (NO_BALANCE, BAD_SERVICE, etc.)
             status_map[idx] = f"❌ [{idx}] failed: {err}"
             o = Order(idx=idx, order_id="", phone="")
             o.status = "failed"
             o._err = err   # type: ignore[attr-defined]
             return o
+
+# ── Buy-pause callbacks (Continue / Stop buttons) ─────────────────────────────
+
+async def cb_buy_continue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")          # buycon:<chat_id>:<idx>
+    key   = (int(parts[1]), int(parts[2]))
+    if key in SLOT_CONT:
+        SLOT_CONT[key].set()
+    await safe_answer(query, "▶ Continuing…")
+    await safe_edit_markup(query, None)
+
+async def cb_buy_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")          # buystop:<chat_id>:<idx>
+    key   = (int(parts[1]), int(parts[2]))
+    if key in SLOT_STOP:
+        SLOT_STOP[key].set()
+    await safe_answer(query, "⏹ Stopping…")
+    await safe_edit_markup(query, None)
+
+# ── Live status updater ───────────────────────────────────────────────────────
+
+async def _delayed_cancel(api_key: str, order: Order, chat_id: int, app: Application):
+    """Wait 2 minutes (site policy) then auto-cancel a registered number."""
+    await asyncio.sleep(120)
+    if order.status not in ("cancelled", "received", "ext_cancel"):
+        set_status(api_key, order.order_id, 8)
+        order.status = "cancelled"
+        try:
+            await app.bot.send_message(
+                chat_id,
+                f"🚫 `{order.phone}` auto-cancelled after 2 min (already registered on Swiggy).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
 async def _live_status_updater(
     status_msg,
@@ -363,7 +527,6 @@ async def _live_status_updater(
     count: int,
     done_evt: asyncio.Event,
 ):
-    """Polls status_map every second and edits the message when content changes."""
     last_text = ""
     while not done_evt.is_set():
         lines    = [status_map.get(i, f"⏳ [{i}] waiting…") for i in range(1, count + 1)]
@@ -376,8 +539,11 @@ async def _live_status_updater(
                 pass
         await asyncio.sleep(1)
 
+# ── recv_count ────────────────────────────────────────────────────────────────
+
 async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     text    = update.message.text.strip()
     s       = sess(chat_id)
 
@@ -392,35 +558,44 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     header     = f"🛒 Purchasing *{count}* number(s) for *{s.service_name}*…"
     status_msg = await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    # Shared state for live updates
     status_map: dict[int, str] = {i: f"⏳ [{i}] waiting…" for i in range(1, count + 1)}
     done_evt = asyncio.Event()
 
-    # Start the live-updater task (polls every 1 s, edits message on change)
     updater_task = asyncio.create_task(
         _live_status_updater(status_msg, header, status_map, count, done_evt)
     )
 
-    # ── Buy all numbers in parallel ───────────────────────────────────────────
     results: list[Order] = await asyncio.gather(
-        *[_buy_one(i, s.api_key, s.service_id, status_map)
-          for i in range(1, count + 1)]
+        *[
+            _buy_one(i, s.api_key, s.service_id, status_map, chat_id, ctx.application)
+            for i in range(1, count + 1)
+        ]
     )
 
-    # Stop updater and do one final edit
     done_evt.set()
-    await asyncio.sleep(1.2)   # let updater fire one last time
+    await asyncio.sleep(1.2)
     updater_task.cancel()
 
-    err_map = {"NO_BALANCE": "Insufficient balance", "BAD_SERVICE": "Invalid service ID", "TRY_AGAIN": "Temporary error"}
-    lines   = []
+    err_map = {
+        "NO_BALANCE":  "Insufficient balance",
+        "BAD_SERVICE": "Invalid service ID",
+        "TRY_AGAIN":   "Temporary error",
+    }
+    lines = []
     for o in results:
         if o.status == "failed":
             err = getattr(o, "_err", "Unknown error")
             lines.append(f"❌ [{o.idx}] Failed: {err_map.get(err, err)}")
+        elif o.status == "stopped":
+            lines.append(f"⏹ [{o.idx}] Stopped by user")
         else:
+            # ── Duplicate phone check ─────────────────────────────────────
+            seen = CHECKED_PHONES.setdefault(user_id, set())
+            if o.phone in seen:
+                lines.append(f"⚠️ [{o.idx}] `{o.phone}` *(already checked before — duplicate)*")
+            else:
+                lines.append(f"✅ [{o.idx}] `{o.phone}`")
             s.orders.append(o)
-            lines.append(f"✅ [{o.idx}] `{o.phone}`")
 
     try:
         await status_msg.edit_text(
@@ -434,8 +609,28 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
     if not s.orders:
-        await update.message.reply_text("❌ Could not buy any numbers. Use /start to try again.")
+        await update.message.reply_text(
+            "❌ Could not buy any numbers.",
+            reply_markup=buy_again_keyboard(),
+        )
         return ConversationHandler.END
+
+    # ── Duplicate-phone warning messages ──────────────────────────────────────
+    seen = CHECKED_PHONES.setdefault(user_id, set())
+    for o in s.orders:
+        if o.phone in seen:
+            try:
+                await update.message.reply_text(
+                    f"⚠️ `{o.phone}` was *already checked in a previous session*. "
+                    f"This number may already be registered.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+    # Record all bought phones as seen
+    for o in s.orders:
+        seen.add(o.phone)
 
     # ── Swiggy-only web check ─────────────────────────────────────────────────
     is_swiggy = "swiggy" in s.service_name.lower()
@@ -444,14 +639,43 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("🔍 Checking each number on Swiggy…")
         for o in s.orders:
             icon, result_text = check_swiggy(o.phone)
-            await update.message.reply_text(
-                f"📞 `{o.phone}`\n"
-                f"🌐 Swiggy check: {icon} {result_text}\n\n"
-                f"What do you want to do with this number?",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=pre_poll_keyboard(o.order_id),
-            )
+            already_registered = (icon == "❌")
+
+            if already_registered:
+                # Site policy: cancellation only allowed after 2 min.
+                # Schedule a background task to cancel after 120 s.
+                asyncio.create_task(
+                    _delayed_cancel(s.api_key, o, chat_id, ctx.application)
+                )
+                try:
+                    await update.message.reply_text(
+                        f"📞 `{o.phone}`\n"
+                        f"🌐 Swiggy: {icon} {result_text}\n\n"
+                        f"⚠️ *Already registered* — will auto-cancel in 2 minutes.",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await update.message.reply_text(
+                        f"📞 `{o.phone}`\n"
+                        f"🌐 Swiggy check: {icon} {result_text}\n\n"
+                        f"What do you want to do with this number?",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=pre_poll_keyboard(o.order_id),
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(0.3)
+
+        remaining = [o for o in s.orders if o.status == "pending"]
+        if not remaining:
+            await update.message.reply_text(
+                "⚡ All numbers were already registered — auto-cancel scheduled in 2 min.",
+                reply_markup=buy_again_keyboard(),
+            )
+            return ConversationHandler.END
 
         await update.message.reply_text(
             "👆 Review numbers above — cancel any you don't need.\n\n"
@@ -459,7 +683,6 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=start_poll_keyboard(),
         )
     else:
-        # No web check — mark all as polling and go straight to polling
         for o in s.orders:
             o.status = "polling"
         phones = "\n".join(f"📞 `{o.phone}`" for o in s.orders)
@@ -517,7 +740,6 @@ async def cb_startpoll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     s       = sess(chat_id)
 
-    # Auto-poll any still-pending numbers (user didn't tap either button)
     for o in s.orders:
         if o.status == "pending":
             o.status = "polling"
@@ -561,7 +783,6 @@ async def poll_all(chat_id: int, app: Application):
             if raw.startswith("STATUS_OK:"):
                 otp = raw.split(":", 1)[1]
                 if otp in o.otps:
-                    # Same OTP as before — keep polling silently for a new one
                     continue
                 o.otps.append(otp)
                 o.status = "otp_check"
@@ -593,7 +814,8 @@ async def poll_all(chat_id: int, app: Application):
                 o.status = "timeout"
                 try:
                     await app.bot.send_message(
-                        chat_id, f"⏰ Number `{o.phone}` timed out (10 min).",
+                        chat_id,
+                        f"⏰ Number `{o.phone}` timed out (10 min).",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 except Exception:
@@ -621,10 +843,17 @@ async def poll_all(chat_id: int, app: Application):
             break
 
 async def send_final_summary(chat_id: int, app: Application):
-    s = sess(chat_id)
+    s     = sess(chat_id)
     lines = []
+    icons = {
+        "received":   "✅",
+        "cancelled":  "❌",
+        "timeout":    "⏰",
+        "ext_cancel": "🚫",
+        "stopped":    "⏹",
+    }
     for o in s.orders:
-        icon     = {"received": "✅", "cancelled": "❌", "timeout": "⏰", "ext_cancel": "🚫"}.get(o.status, "❓")
+        icon     = icons.get(o.status, "❓")
         otp_text = " | ".join(o.otps) if o.otps else o.status
         lines.append(f"{icon} [{o.idx}] `{o.phone}` — {otp_text}")
 
@@ -634,9 +863,9 @@ async def send_final_summary(chat_id: int, app: Application):
     try:
         await app.bot.send_message(
             chat_id,
-            "📋 *Final Results*\n\n" + "\n".join(lines) + bal_text +
-            "\n\nSend /start to buy more numbers.",
+            "📋 *Final Results*\n\n" + "\n".join(lines) + bal_text,
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=buy_again_keyboard(),
         )
     except Exception:
         pass
@@ -723,11 +952,9 @@ async def cb_cancel_one(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         order.status = "cancelled"
         await safe_answer(query, f"❌ Cancelled {order.phone}")
 
-        # Remove this button from the wait message
         still = [o for o in s.orders if o.status == "polling"]
         await safe_edit_markup(query, wait_keyboard(still) if still else None)
 
-        # New message confirming action
         try:
             await query.message.reply_text(
                 f"❌ `{order.phone}` has been *cancelled.*",
@@ -736,7 +963,6 @@ async def cb_cancel_one(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Confirm still-polling numbers continue
         if still:
             phones = ", ".join(f"`{o.phone}`" for o in still)
             try:
@@ -769,28 +995,22 @@ async def cb_keep_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Global error handler ──────────────────────────────────────────────────────
 
-import logging
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.WARNING,
-)
-
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, (TimedOut, BadRequest)):
-        return  # transient Telegram network hiccups — ignore silently
+        return
     logging.warning("Unhandled exception: %s", ctx.error)
 
 # ── "cancel" text handler (works any time, including during polling) ──────────
 
 async def msg_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User typed 'cancel' — show live cancel menu if polling is active."""
     chat_id = update.effective_chat.id
     s       = sess(chat_id)
 
     still = [o for o in s.orders if o.status == "polling"]
     if not still:
         await update.message.reply_text(
-            "No numbers are currently being polled.\nSend /start to buy numbers."
+            "No numbers are currently being polled.",
+            reply_markup=buy_again_keyboard(),
         )
         return
 
@@ -804,7 +1024,10 @@ async def msg_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /cancel (inside conversation flow) ───────────────────────────────────────
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Cancelled. Send /start to begin again.")
+    await update.message.reply_text(
+        "❌ Operation stopped.",
+        reply_markup=buy_again_keyboard(),
+    )
     return ConversationHandler.END
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -814,7 +1037,9 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No API key set. Use /start first.")
         return
     bal = get_balance(api_key)
-    await update.message.reply_text(f"💰 Balance: ₹{bal}" if bal else "❌ Could not fetch balance.")
+    await update.message.reply_text(
+        f"💰 Balance: ₹{bal}" if bal else "❌ Could not fetch balance."
+    )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -822,7 +1047,10 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CallbackQueryHandler(cb_buy_again, pattern=r"^buy_again$"),
+        ],
         states={
             WAIT_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_api_key)],
             WAIT_SEARCH: [
@@ -841,17 +1069,26 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_error_handler(error_handler)
 
-    # "cancel" typed as plain text during polling
+    # Plain-text "cancel" during polling
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(r"(?i)^cancel$"),
         msg_cancel,
     ))
 
-    app.add_handler(CallbackQueryHandler(cb_precancel, pattern=r"^precancel:"))
-    app.add_handler(CallbackQueryHandler(cb_keepoll,   pattern=r"^keepoll:"))
-    app.add_handler(CallbackQueryHandler(cb_startpoll, pattern=r"^startpoll$"))
-    app.add_handler(CallbackQueryHandler(cb_done,      pattern=r"^done:"))
-    app.add_handler(CallbackQueryHandler(cb_more,      pattern=r"^more:"))
+    # Buy-pause (30-attempt prompt) callbacks
+    app.add_handler(CallbackQueryHandler(cb_buy_continue, pattern=r"^buycon:"))
+    app.add_handler(CallbackQueryHandler(cb_buy_stop,     pattern=r"^buystop:"))
+
+    # Swiggy pre-poll & start-poll
+    app.add_handler(CallbackQueryHandler(cb_precancel,  pattern=r"^precancel:"))
+    app.add_handler(CallbackQueryHandler(cb_keepoll,    pattern=r"^keepoll:"))
+    app.add_handler(CallbackQueryHandler(cb_startpoll,  pattern=r"^startpoll$"))
+
+    # OTP decision
+    app.add_handler(CallbackQueryHandler(cb_done,       pattern=r"^done:"))
+    app.add_handler(CallbackQueryHandler(cb_more,       pattern=r"^more:"))
+
+    # Wait-menu
     app.add_handler(CallbackQueryHandler(cb_cancel_all, pattern=r"^cancel_all$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_one, pattern=r"^cancel_one:"))
     app.add_handler(CallbackQueryHandler(cb_keep_wait,  pattern=r"^keep_wait$"))
