@@ -120,7 +120,13 @@ def set_status(api_key: str, order_id: str, code: int) -> str:
 
 # ── Swiggy web check ──────────────────────────────────────────────────────────
 
-def check_swiggy(phone: str) -> tuple[str, str]:
+def check_swiggy(phone: str) -> tuple[str, str, bool | None]:
+    """
+    Returns (icon, text, is_registered):
+      is_registered=True  → 'success' class → number IS registered on Swiggy → auto-cancel
+      is_registered=False → 'error'   class → number is NOT registered → keep for OTP
+      is_registered=None  → unknown / no result yet → caller should retry
+    """
     try:
         r = req.post(CHECK_URL, data={"mobile": phone}, timeout=30)
         m = re.search(
@@ -130,11 +136,15 @@ def check_swiggy(phone: str) -> tuple[str, str]:
         if m:
             cls  = m.group(1)
             text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            icon = {"success": "✅", "error": "❌", "info": "ℹ️"}.get(cls, "❓")
-            return icon, text
-        return "❓", "No result returned from site."
+            if cls == "success":
+                return "✅", text, True    # registered  → auto-cancel
+            elif cls == "error":
+                return "❌", text, False   # NOT registered → keep
+            else:                          # info / anything else → unknown
+                return "ℹ️", text, None
+        return "❓", "No result yet — retrying…", None
     except Exception as e:
-        return "⚠️", f"Check failed: {e}"
+        return "⚠️", f"Check failed: {e}", None
 
 # ── Session / Order model ─────────────────────────────────────────────────────
 
@@ -638,12 +648,28 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if is_swiggy:
         await update.message.reply_text("🔍 Checking each number on Swiggy…")
         for o in s.orders:
-            icon, result_text = check_swiggy(o.phone)
-            already_registered = (icon == "❌")
 
-            if already_registered:
+            # ── Retry until we get a definitive answer ────────────────────────
+            icon, result_text, is_registered = "❓", "No result yet.", None
+            for attempt in range(1, 11):          # up to 10 retries
+                icon, result_text, is_registered = check_swiggy(o.phone)
+                if is_registered is not None:
+                    break                          # got a clear answer
+                # Unknown response — wait and retry
+                try:
+                    if attempt == 1:
+                        await update.message.reply_text(
+                            f"📞 `{o.phone}`\n"
+                            f"🌐 {icon} {result_text} (retry {attempt}/10)…",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+            if is_registered is True:
+                # Number IS registered on Swiggy → useless for OTP
                 # Site policy: cancellation only allowed after 2 min.
-                # Schedule a background task to cancel after 120 s.
                 asyncio.create_task(
                     _delayed_cancel(s.api_key, o, chat_id, ctx.application)
                 )
@@ -656,7 +682,9 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                     )
                 except Exception:
                     pass
-            else:
+
+            elif is_registered is False:
+                # Number is NOT registered → good, show keep/cancel choice
                 try:
                     await update.message.reply_text(
                         f"📞 `{o.phone}`\n"
@@ -667,6 +695,20 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                     )
                 except Exception:
                     pass
+
+            else:
+                # Still unknown after all retries → let user decide
+                try:
+                    await update.message.reply_text(
+                        f"📞 `{o.phone}`\n"
+                        f"🌐 Swiggy: ❓ Could not determine status after 10 attempts.\n\n"
+                        f"What do you want to do with this number?",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=pre_poll_keyboard(o.order_id),
+                    )
+                except Exception:
+                    pass
+
             await asyncio.sleep(0.3)
 
         remaining = [o for o in s.orders if o.status == "pending"]
