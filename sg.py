@@ -483,7 +483,7 @@ async def _buy_one(
                 # else: continue — reset streak counter so next prompt is 30 more
                 no_num_count = 0
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
         else:
             # Hard error (NO_BALANCE, BAD_SERVICE, etc.)
@@ -549,7 +549,7 @@ async def _live_status_updater(
                 pass
         await asyncio.sleep(1)
 
-# ── recv_count ────────────────────────────────────────────────────────────────
+# ── recv_count — thin launcher, returns END immediately to free the conv lock ──
 
 async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
@@ -568,6 +568,29 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     header     = f"🛒 Purchasing *{count}* number(s) for *{s.service_name}*…"
     status_msg = await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
+    # Launch as background task — this releases the ConversationHandler lock
+    # immediately so that Continue/Stop button callbacks can be processed.
+    if s.poll_task and not s.poll_task.done():
+        s.poll_task.cancel()
+    s.poll_task = asyncio.create_task(
+        _buy_all_task(chat_id, user_id, ctx.application, count, status_msg)
+    )
+
+    return ConversationHandler.END
+
+
+# ── _buy_all_task — runs in background, uses app.bot.send_message ─────────────
+
+async def _buy_all_task(
+    chat_id:    int,
+    user_id:    int,
+    app:        Application,
+    count:      int,
+    status_msg,
+):
+    s      = sess(chat_id)
+    header = f"🛒 Purchasing *{count}* number(s) for *{s.service_name}*…"
+
     status_map: dict[int, str] = {i: f"⏳ [{i}] waiting…" for i in range(1, count + 1)}
     done_evt = asyncio.Event()
 
@@ -577,7 +600,7 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     results: list[Order] = await asyncio.gather(
         *[
-            _buy_one(i, s.api_key, s.service_id, status_map, chat_id, ctx.application)
+            _buy_one(i, s.api_key, s.service_id, status_map, chat_id, app)
             for i in range(1, count + 1)
         ]
     )
@@ -586,11 +609,13 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await asyncio.sleep(1.2)
     updater_task.cancel()
 
+    # ── Build result summary ───────────────────────────────────────────────────
     err_map = {
         "NO_BALANCE":  "Insufficient balance",
         "BAD_SERVICE": "Invalid service ID",
         "TRY_AGAIN":   "Temporary error",
     }
+    seen  = CHECKED_PHONES.setdefault(user_id, set())
     lines = []
     for o in results:
         if o.status == "failed":
@@ -599,8 +624,6 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         elif o.status == "stopped":
             lines.append(f"⏹ [{o.idx}] Stopped by user")
         else:
-            # ── Duplicate phone check ─────────────────────────────────────
-            seen = CHECKED_PHONES.setdefault(user_id, set())
             if o.phone in seen:
                 lines.append(f"⚠️ [{o.idx}] `{o.phone}` *(already checked before — duplicate)*")
             else:
@@ -612,25 +635,33 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             f"🛒 *{s.service_name}* — {len(s.orders)}/{count} bought:\n\n" + "\n".join(lines),
             parse_mode=ParseMode.MARKDOWN,
         )
-    except (BadRequest, TimedOut):
-        await update.message.reply_text(
-            f"🛒 *{s.service_name}* — {len(s.orders)}/{count} bought:\n\n" + "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    except Exception:
+        try:
+            await app.bot.send_message(
+                chat_id,
+                f"🛒 *{s.service_name}* — {len(s.orders)}/{count} bought:\n\n" + "\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
     if not s.orders:
-        await update.message.reply_text(
-            "❌ Could not buy any numbers.",
-            reply_markup=buy_again_keyboard(),
-        )
-        return ConversationHandler.END
+        try:
+            await app.bot.send_message(
+                chat_id,
+                "❌ Could not buy any numbers.",
+                reply_markup=buy_again_keyboard(),
+            )
+        except Exception:
+            pass
+        return
 
-    # ── Duplicate-phone warning messages ──────────────────────────────────────
-    seen = CHECKED_PHONES.setdefault(user_id, set())
+    # ── Duplicate-phone warnings ───────────────────────────────────────────────
     for o in s.orders:
         if o.phone in seen:
             try:
-                await update.message.reply_text(
+                await app.bot.send_message(
+                    chat_id,
                     f"⚠️ `{o.phone}` was *already checked in a previous session*. "
                     f"This number may already be registered.",
                     parse_mode=ParseMode.MARKDOWN,
@@ -638,7 +669,7 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             except Exception:
                 pass
 
-    # Record all bought phones as seen
+    # Record all bought phones as seen from this point on
     for o in s.orders:
         seen.add(o.phone)
 
@@ -646,21 +677,23 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     is_swiggy = "swiggy" in s.service_name.lower()
 
     if is_swiggy:
-        await update.message.reply_text("🔍 Checking each number on Swiggy…")
-        for o in s.orders:
+        try:
+            await app.bot.send_message(chat_id, "🔍 Checking each number on Swiggy…")
+        except Exception:
+            pass
 
-            # ── Retry until we get a definitive answer ────────────────────────
+        for o in s.orders:
+            # Retry until a definitive answer arrives
             icon, result_text, is_registered = "❓", "No result yet.", None
-            for attempt in range(1, 11):          # up to 10 retries
+            for attempt in range(1, 11):
                 icon, result_text, is_registered = check_swiggy(o.phone)
                 if is_registered is not None:
-                    break                          # got a clear answer
-                # Unknown response — wait and retry
+                    break
                 try:
                     if attempt == 1:
-                        await update.message.reply_text(
-                            f"📞 `{o.phone}`\n"
-                            f"🌐 {icon} {result_text} (retry {attempt}/10)…",
+                        await app.bot.send_message(
+                            chat_id,
+                            f"📞 `{o.phone}`\n🌐 {icon} {result_text} — retrying…",
                             parse_mode=ParseMode.MARKDOWN,
                         )
                 except Exception:
@@ -668,15 +701,11 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 await asyncio.sleep(4)
 
             if is_registered is True:
-                # Number IS registered on Swiggy → useless for OTP
-                # Site policy: cancellation only allowed after 2 min.
-                asyncio.create_task(
-                    _delayed_cancel(s.api_key, o, chat_id, ctx.application)
-                )
+                asyncio.create_task(_delayed_cancel(s.api_key, o, chat_id, app))
                 try:
-                    await update.message.reply_text(
-                        f"📞 `{o.phone}`\n"
-                        f"🌐 Swiggy: {icon} {result_text}\n\n"
+                    await app.bot.send_message(
+                        chat_id,
+                        f"📞 `{o.phone}`\n🌐 Swiggy: {icon} {result_text}\n\n"
                         f"⚠️ *Already registered* — will auto-cancel in 2 minutes.",
                         parse_mode=ParseMode.MARKDOWN,
                     )
@@ -684,11 +713,10 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                     pass
 
             elif is_registered is False:
-                # Number is NOT registered → good, show keep/cancel choice
                 try:
-                    await update.message.reply_text(
-                        f"📞 `{o.phone}`\n"
-                        f"🌐 Swiggy check: {icon} {result_text}\n\n"
+                    await app.bot.send_message(
+                        chat_id,
+                        f"📞 `{o.phone}`\n🌐 Swiggy: {icon} {result_text}\n\n"
                         f"What do you want to do with this number?",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=pre_poll_keyboard(o.order_id),
@@ -697,11 +725,10 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                     pass
 
             else:
-                # Still unknown after all retries → let user decide
                 try:
-                    await update.message.reply_text(
-                        f"📞 `{o.phone}`\n"
-                        f"🌐 Swiggy: ❓ Could not determine status after 10 attempts.\n\n"
+                    await app.bot.send_message(
+                        chat_id,
+                        f"📞 `{o.phone}`\n🌐 Swiggy: ❓ Could not determine status.\n\n"
                         f"What do you want to do with this number?",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=pre_poll_keyboard(o.order_id),
@@ -713,30 +740,41 @@ async def recv_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
         remaining = [o for o in s.orders if o.status == "pending"]
         if not remaining:
-            await update.message.reply_text(
-                "⚡ All numbers were already registered — auto-cancel scheduled in 2 min.",
-                reply_markup=buy_again_keyboard(),
-            )
-            return ConversationHandler.END
+            try:
+                await app.bot.send_message(
+                    chat_id,
+                    "⚡ All numbers already registered — auto-cancel scheduled in 2 min.",
+                    reply_markup=buy_again_keyboard(),
+                )
+            except Exception:
+                pass
+            return
 
-        await update.message.reply_text(
-            "👆 Review numbers above — cancel any you don't need.\n\n"
-            "When ready, tap below to start polling for OTPs:",
-            reply_markup=start_poll_keyboard(),
-        )
+        try:
+            await app.bot.send_message(
+                chat_id,
+                "👆 Review numbers above — cancel any you don't need.\n\n"
+                "When ready, tap below to start polling for OTPs:",
+                reply_markup=start_poll_keyboard(),
+            )
+        except Exception:
+            pass
+
     else:
         for o in s.orders:
             o.status = "polling"
         phones = "\n".join(f"📞 `{o.phone}`" for o in s.orders)
-        await update.message.reply_text(
-            f"*Numbers ready:*\n{phones}\n\n💰 ₹{s.listed_price} each\n\n⏳ Polling for OTPs…",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await app.bot.send_message(
+                chat_id,
+                f"*Numbers ready:*\n{phones}\n\n💰 ₹{s.listed_price} each\n\n⏳ Polling for OTPs…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
         if s.poll_task and not s.poll_task.done():
             s.poll_task.cancel()
-        s.poll_task = asyncio.create_task(poll_all(chat_id, ctx.application))
-
-    return ConversationHandler.END
+        s.poll_task = asyncio.create_task(poll_all(chat_id, app))
 
 # ── Pre-poll buttons (Swiggy check results) ───────────────────────────────────
 
